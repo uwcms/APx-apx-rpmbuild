@@ -227,7 +227,7 @@ def get_package_version(tag: str = 'HEAD', force_dirty: Optional[bool] = None) -
 	# when a new tag is actually produced, not for addcommits, which is
 	# convenient since this format can't support addcommits.
 	version['VERSION_SOFILE'] = '{major}.{minor}.{patch}'.format(**version)
-	version['VERSION_MMP'] = version['VERSION_SOFILE'] + ('.' + addcommit_tag if int(version['addcommits']) else '')
+	version['VERSION_MMP'] = version['VERSION_SOFILE'] + ('.' + addcommit_tag if addcommit_tag else '')
 	version['VERSION_SEMVER'] = version['semver']
 
 	# RPMVER is a pain. RPM version semantics dont quite match up with semver.
@@ -294,7 +294,7 @@ if ARGS.build is not None:
 	SPECFILE = os.path.join(WORKDIR.name, os.path.basename(ARGS.build))
 	git_checkout(os.path.abspath(ARGS.repository), ARGS.revision, os.path.join(WORKDIR.name, 'repo'))
 	with SafeCD(os.path.join(WORKDIR.name, 'repo')):
-		VERSION = get_package_version(force_dirty=(ARGS.revision == 'DIRTY'))
+		VERSION = get_package_version(force_dirty=True if ARGS.revision == 'DIRTY' else None)
 		shutil.copyfile(ARGS.build, SPECFILE)
 
 	# Now we can generate the final specfile by injecting our version macros as
@@ -384,6 +384,7 @@ if ARGS.build is not None:
 if ARGS.generate_version is not None:
 	with SafeCD(os.path.join(WORKDIR.name, 'repo') if ARGS.build else SOURCE_REPO):
 		VERSION = get_package_version(
-		    'HEAD' if ARGS.build or ARGS.revision == 'DIRTY' else ARGS.revision, (ARGS.revision == 'DIRTY')
+		    'HEAD' if ARGS.build or ARGS.revision == 'DIRTY' else ARGS.revision,
+		    True if ARGS.revision == 'DIRTY' else None
 		)
 	print('\n'.join(generate_versioninfo_variables(VERSION, ARGS.generate_version)))
