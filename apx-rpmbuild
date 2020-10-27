@@ -1,0 +1,389 @@
+#!/usr/bin/python3
+
+import argparse
+import contextlib
+import datetime
+import glob
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Dict, List, NoReturn, Optional
+
+logging.basicConfig(format='%(levelname).1s: %(message)s')
+
+parser = argparse.ArgumentParser()
+# yapf: disable
+parser.add_argument('-R', '--repository', action='store', default='.', help='The repository to work on.  Defaults to "."')
+parser.add_argument('-r', '--revision', action='store', default='HEAD', help='The git commitish to build (or "DIRTY" for the current checkout) (default: HEAD)')
+parser.add_argument('-B', '--build-metadata', action='store', default=None, help='Override the Semantic Version build metadata found (or not) in the tag.')
+parser.add_argument('--force-buildstamp', action='store_true', help='Force the addition of the buildstamp to the package version.')
+parser.add_argument('--tag-match-pattern', action='store', default='v[0-9]*.[0-9]*.[0-9]*', help='An alternate pattern to locate tags with `git describe --match=` -- NOT REGEXP')
+parser.add_argument('--tag-parse-pattern', action='store', default='^v(?P<version>.*)$', help='A regex required with --tag-match-pattern to extract the version and related git-describe data.')
+parser.add_argument('--version-macro-prefix', action='store', default='version_', help='Set the prefix of rpm macros supplied with computed version information. (blank to disable)')
+parser.add_argument('-g', '--generate-version', action='store', default=None, choices=('json','rpm','shell'), help='Generate version information to stdout in the requested format.')
+parser.add_argument('-b', '--build', action='store', default=None, help='The specfile to build.  Relative paths interpreted from repository root.')
+parser.add_argument('-s', '--sign', action='store', default=False, nargs='?', const=True, metavar='KEYID', help='Sign the RPM')
+parser.add_argument('--gpg-homedir', action='store', default=None, help='A value to supply to rpmsign as _gpg_path.')
+parser.add_argument('-o', '--output-dir', action='store', default='.', help='The directory the finished RPMs should be placed in.')
+parser.add_argument('-v', '--verbose', action='store_true', help='Be noisy.')
+# parser.add_argument('path', action='store', nargs='*', default=[])
+# yapf: enable
+ARGS = parser.parse_args()
+
+if ARGS.verbose:
+	logging.getLogger().setLevel(logging.DEBUG)
+
+### Generate our workspace.
+
+ORIGCWD = os.getcwd()
+WORKDIR = tempfile.TemporaryDirectory(prefix='rpmbuild.')
+
+
+def error_abort(message: str) -> NoReturn:
+	logging.error(message)
+	raise SystemExit(1)
+
+
+@contextlib.contextmanager
+def SafeCD(newcwd: Optional[str] = None):
+	oldcwd = os.getcwd()
+	try:
+		if newcwd is not None:
+			os.chdir(newcwd)
+		yield os.getcwd()
+	finally:
+		os.chdir(oldcwd)
+
+
+def find_repo_root(repo: str) -> str:
+	with SafeCD(repo):
+		while True:
+			parent = subprocess.run(['git', 'rev-parse', '--show-superproject-working-tree'],
+			                        stdout=subprocess.PIPE,
+			                        check=True).stdout.decode('utf8').strip('\n')
+			if not parent:
+				break
+			os.chdir(parent)
+		return subprocess.run(['git', 'rev-parse', '--show-toplevel'], stdout=subprocess.PIPE,
+		                      check=True).stdout.decode('utf8').strip('\n')
+
+
+def subprocess_checksilent(*args, **kwargs):
+	if ARGS.verbose:
+		subprocess.run(*args, **kwargs, check=True)
+		return
+	ret = None
+	ret = subprocess.run(*args, **kwargs, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+	# Print output if error
+	try:
+		ret.check_returncode()
+	except:
+		if ret is not None:
+			logging.error('Error executing process ' + repr(args[0]))
+			print(ret.stdout.decode('utf8'))
+		raise
+
+
+def git_recursive_referential_checkout(modrepo_prefix: str, modpath_prefix: str = '') -> None:
+	'''Init & update all submodules of the current directory recursively, with --reference.'''
+	# All this manual effort becuase git isn't smart enough to --reference
+	# recursively properly.
+	try:
+		gitmodules_file = open(os.path.join('.gitmodules'), 'r')
+	except:
+		return  # Nothing to see here, I guess.
+
+	# Parse the .gitmodules file we found.
+	gitmodules = []
+	modname: Optional[str] = None
+	for line in gitmodules_file:
+		m = re.match(r'^\[submodule "(.*)"\]$', line.strip())
+		if m is not None:
+			modname = m.group(1)
+		m = re.match(r'^path\s*=\s*(.*)$', line.strip())
+		if m is not None and modname is not None:
+			gitmodules.append((os.path.join(modrepo_prefix, 'modules', modname), m.group(1)))
+			modname = None
+	for modrepo, modpath in gitmodules:
+		logging.info('*** Initializing submodule {modpath}'.format(modpath=os.path.join(modpath_prefix, modpath)))
+		subprocess_checksilent(['git', 'submodule', 'update', '--init', '--reference=' + modrepo, modpath])
+		# Now recurse
+		with SafeCD(modpath):
+			git_recursive_referential_checkout(modrepo, os.path.join(modpath_prefix, modpath))
+
+
+def git_checkout(repo: str, tag: str, target: str) -> None:
+	'''Check out the specified tag of the specified repository in the specified target location.'''
+	if tag == 'DIRTY':
+		logging.info(
+		    '*** Copying the current checkout to a temporary directory, and skipping all other checkout operations.'
+		)
+		subprocess.run([
+		    'rsync', '-rah', '--no-inc-recursive', '--info=progress2',
+		    repo.rstrip('/') + '/',
+		    target.rstrip('/') + '/'
+		],
+		               check=True)
+	else:
+		rev_hash = subprocess.run(
+		    ['git', 'rev-parse', tag],
+		    stdout=subprocess.PIPE,
+		    check=True,
+		).stdout.decode('utf8').strip()
+		logging.info('*** Cloning the repository in a temporary directory.')
+		subprocess_checksilent(['git', 'clone', '-n', '-s', repo, target])
+		with SafeCD(target):
+			logging.info('*** Checking out {revision} ({rev_hash})'.format(revision=ARGS.revision, rev_hash=rev_hash))
+			subprocess_checksilent(['git', 'checkout', '-f', rev_hash])
+			git_recursive_referential_checkout(os.path.join(ORIGCWD, '.git'))
+
+
+def get_package_version(tag: str = 'HEAD', force_dirty: Optional[bool] = None) -> Dict[str, str]:
+	'''Generates all relevant version information from the current directory repository, and specified tag.'''
+	raw_ver = subprocess.run(['git', 'describe', '--long', '--match=' + ARGS.tag_match_pattern, tag],
+	                         check=True,
+	                         stdout=subprocess.PIPE).stdout.decode('utf8').strip()
+	m = re.search(ARGS.tag_parse_pattern, raw_ver)
+	if m is None or 'version' not in m.groupdict():
+		error_abort(
+		    '*** Unable to parse the git tag {raw_ver} with the pattern {parse_pattern}'.format(
+		        raw_ver=repr(raw_ver), parse_pattern=repr(ARGS.tag_parse_pattern)
+		    )
+		)
+
+	version_data = m.group('version')
+	m = re.match(r'^(?P<semver>.*)-(?P<addcommits>[0-9]+)-g(?P<hash>[0-9a-f]+)$', version_data)
+	if m is None:
+		error_abort('*** Unable to extract git-describe components from {}'.format(repr(version_data)))
+
+	version: Dict[str, str] = m.groupdict()
+
+	# Courtesy of https://semver.org/
+	SEMVER_PARSER_RE = r'''^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$'''
+	m = re.match(SEMVER_PARSER_RE, version['semver'])
+	if m is None:
+		error_abort('*** Invalid Semantic Version (https://semver.org/) {}'.format(repr(version['semver'])))
+
+	version.update({x: '' for x in ('major', 'minor', 'patch', 'prerelease', 'buildmetadata')})
+	version.update(m.groupdict())
+
+	if subprocess.run(['git', 'status', '-z'], stdout=subprocess.PIPE, check=True).stdout.decode('utf8').strip():
+		# We have SOMETHING in git status, so we're dirty.
+		version['dirty'] = '1'
+	else:
+		version['dirty'] = '0'
+
+	version = {x: (y if y is not None else '') for x, y in version.items()}
+	if version['addcommits'] != '0':
+		# If this is an untagged version in the future of our tag, don't
+		# automatically include that tag's build metadata.
+		version['buildmetadata'] = ''
+	if ARGS.build_metadata is not None:
+		version['buildmetadata'] = ARGS.build_metadata
+
+	# If we have a dirty build OR we have added revisions past our tag, we need
+	# to include a build timestamp, and the dirty flag.  These technically
+	# define the fundamental version, so we need to stuff them in after MMP. The
+	# only semver-valid option for this is in prerelease.  This volates semver.
+	# We don't have a choice.  We will violate semver here.  These aren't
+	# included in official release tags regardless.
+	#
+	# This is required becuase without it, ammends, rebases, resets, etc would
+	# result in nonincreasing version numbers in a development tree, which could
+	# be undesirable.  The actual 'dirty' flag is mainly for information
+	# purposes however.
+	#
+	# I'm... not going to worry about timezones.
+	addcommit_tag = ''
+	want_addcommit_tag = False
+	if int(version['addcommits']) or int(version['dirty']) or force_dirty is True:
+		want_addcommit_tag = True
+	if force_dirty is False:
+		want_addcommit_tag = False
+	if ARGS.force_buildstamp:
+		want_addcommit_tag = True
+	if want_addcommit_tag:
+		addcommit_tag = '{addcommits}.{buildstamp}.g{hash}.{dirty}'.format(
+		    **version, buildstamp=datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
+		)
+
+	# Reconstruct the overall semver, now that we have updated build metadata.
+	version['semver'] = '{major}.{minor}.{patch}'.format(**version)
+	if addcommit_tag:
+		version['semver'] += '.' + addcommit_tag
+	if version['prerelease']:
+		version['semver'] += '-{prerelease}'.format(**version)
+	if version['buildmetadata']:
+		version['semver'] += '+{buildmetadata}'.format(**version)
+
+	# Build 'meta' versions.
+	#
+	# .so files need to have an A.B.C versioning format, and should change only
+	# when a new tag is actually produced, not for addcommits, which is
+	# convenient since this format can't support addcommits.
+	version['VERSION_SOFILE'] = '{major}.{minor}.{patch}'.format(**version)
+	version['VERSION_MMP'] = version['VERSION_SOFILE'] + ('.' + addcommit_tag if int(version['addcommits']) else '')
+	version['VERSION_SEMVER'] = version['semver']
+
+	# RPMVER is a pain. RPM version semantics dont quite match up with semver.
+	version['VERSION_RPM'] = version['VERSION_MMP']
+
+	# RPM uses '-' to separate release ("armv7hl"), and '~' for prerelease.
+	#
+	# I believe - is legal in semver.  It has special meaning in RPM.
+	if version['prerelease']:
+		version['VERSION_RPM'] += '~{prerelease}'.format(prerelease=version['prerelease'].replace('-', '_'))
+
+	# RPM puts their build serial number in the "Release" field, which comes
+	# after a hyphen in the final version, but isnt part of the "Version" field.
+	if version['buildmetadata']:
+		version['VERSION_RPM'] += '-{buildmetadata}'.format(**version)
+
+	# Now, "Version" and "Release" are separate fields in RPM spec land.  We'll
+	# want to provide a variable for each.  They are joined by '-' in the
+	# ultimate version string.  We've translated all '-' in the prerelease to
+	# '_', so we can do a str.split() here.
+	#
+	# If there's no build info at all in this tag, we'll let that field be '1'.
+	# Spec files should append '.%{?dist}' to this value separately.
+	specver = version['VERSION_RPM'].split('-', 1) + ['1']
+	version['VERSION_RPM_SPEC_VERSION'] = specver[0]
+	version['VERSION_RPM_SPEC_RELEASE'] = specver[1]
+	return version
+
+
+def generate_versioninfo_variables(version: Dict[str, str], output_type: str) -> List[str]:
+	if output_type == 'json':
+		return [json.dumps({k[8:]: v for k, v in VERSION.items() if k.startswith('VERSION_')}, sort_keys=True)]
+
+	shellvars = []
+	for k, v in VERSION.items():
+		if k.startswith('VERSION_'):
+			shellvars.append(
+			    "{k}='{v}'".format(k=ARGS.version_macro_prefix.upper() + k[8:].upper(), v=v.replace("'", "'\\''"))
+			)
+
+	if output_type == 'shell':
+		return ['export ' + x for x in shellvars]
+	else:
+		out = []
+		for k, v in VERSION.items():
+			if k.startswith('VERSION_'):
+				k = ARGS.version_macro_prefix + k[8:].lower()
+				out.append('%define {k} {v}'.format(k=k, v=v))
+		out.append(
+		    '%define {version_macro_prefix}shellvars {vars}'.format(
+		        version_macro_prefix=ARGS.version_macro_prefix, vars=' '.join(shellvars)
+		    )
+		)
+		return out
+
+
+SOURCE_REPO = find_repo_root(ARGS.repository)
+if not SOURCE_REPO:
+	error_abort('Unable to find source repository.')
+
+if ARGS.build is not None:
+	if not ARGS.build.endswith('.spec'):
+		error_abort('You must supply a .spec file to --build.')
+	SPECFILE = os.path.join(WORKDIR.name, os.path.basename(ARGS.build))
+	git_checkout(os.path.abspath(ARGS.repository), ARGS.revision, os.path.join(WORKDIR.name, 'repo'))
+	with SafeCD(os.path.join(WORKDIR.name, 'repo')):
+		VERSION = get_package_version(force_dirty=(ARGS.revision == 'DIRTY'))
+		shutil.copyfile(ARGS.build, SPECFILE)
+
+	# Now we can generate the final specfile by injecting our version macros as
+	# required.
+	if ARGS.version_macro_prefix:
+		with open(SPECFILE, 'r') as rfd:
+			with open(SPECFILE + '~', 'w') as wfd:
+				wfd.write('\n'.join(generate_versioninfo_variables(VERSION, 'rpm')) + '\n\n')
+				wfd.write(rfd.read())
+		os.rename(SPECFILE + '~', SPECFILE)
+
+	# Time to set up the RPM build root.
+	os.makedirs(os.path.join(WORKDIR.name, 'rpmbuild/SOURCES'))
+	# Get the source filename out of the spec file and generate the tarball with
+	# that name.
+	SPECINFO = subprocess.run(['rpmspec', '--qf', '%{NAME}\n%{VERSION}\n[%{SOURCE}\n]', '--srpm', '-q', SPECFILE],
+	                          stdout=subprocess.PIPE,
+	                          check=True).stdout.decode('utf8').rstrip('\n').split('\n')
+	if len(SPECINFO) < 2:
+		error_abort('Unable to retrieve package Name and Version fields from the specfile.')
+	SPEC_NAME = SPECINFO[0]
+	SPEC_VERSION = SPECINFO[1]
+	SOURCES = SPECINFO[2:]
+
+	# We must, for rpmbuild automacros sake rename the dir in the tarfile to %{name}-%{version}.
+	os.rename(os.path.join(WORKDIR.name, 'repo'), os.path.join(WORKDIR.name, SPEC_NAME + '-' + SPEC_VERSION))
+
+	if len(SOURCES) > 1:
+		error_abort('We only support generating one source file.')
+	if SOURCES:
+		tarflags = '-c'
+		if SOURCES[0].endswith('bz2'):
+			tarflags += 'j'
+		elif SOURCES[0].endswith('gz'):
+			tarflags += 'z'
+		elif SOURCES[0].endswith('xz'):
+			tarflags += 'J'
+		subprocess_checksilent([
+		    'tar',
+		    tarflags,
+		    '-f',
+		    os.path.join(WORKDIR.name, 'rpmbuild', 'SOURCES', SOURCES[0]),
+		    '-C',
+		    WORKDIR.name,
+		    '--exclude-vcs-ignores',
+		    '--exclude=.git',
+		    SPEC_NAME + '-' + SPEC_VERSION,
+		])
+	# Let's put the repo back, just in case we need it again later.
+	os.rename(os.path.join(WORKDIR.name, SPEC_NAME + '-' + SPEC_VERSION), os.path.join(WORKDIR.name, 'repo'))
+
+	# Moment of truth! Build it!
+	with SafeCD(WORKDIR.name):
+		logging.info('*** Building RPMs.')
+		subprocess_checksilent(['rpmbuild', '-ba', '-D', '_topdir ' + os.path.join(WORKDIR.name, 'rpmbuild'), SPECFILE])
+		# Done! Collect the RPMs
+		os.makedirs(os.path.join(WORKDIR.name, 'rpms'))
+		for rpm in glob.glob(os.path.join(WORKDIR.name, 'rpmbuild', 'RPMS', '*', '*.rpm')):
+			os.rename(rpm, os.path.join(WORKDIR.name, 'rpms', os.path.basename(rpm)))
+		for rpm in glob.glob(os.path.join(WORKDIR.name, 'rpmbuild', 'SRPMS', '*.rpm')):
+			os.rename(rpm, os.path.join(WORKDIR.name, 'rpms', os.path.basename(rpm)))
+		# And now that it's built, sign all discovered RPMs
+		if ARGS.sign:
+			with SafeCD(os.path.join(WORKDIR.name, 'rpms')):
+				logging.info('*** Signing RPMs.')
+				signcmd = [
+				    'rpmsign',
+				    '-D',
+				    '_topdir ' + os.path.join(WORKDIR.name, 'rpmbuild'),
+				]
+				if ARGS.gpg_homedir:
+					signcmd.extend(['-D', '_gpg_home ' + ARGS.gpg_homedir])
+				if ARGS.sign is not True:
+					signcmd.extend(['-D', '_gpg_name ' + ARGS.sign])
+				signcmd.append('--addsign')
+				signcmd.extend(glob.glob('*.rpm'))
+				# This might ask for a passphrase, so no redirection is possible.
+				subprocess.run(signcmd, check=True)
+
+	# And finally, deliver the products
+	logging.info('*** Moving RPMs to {}.'.format(os.path.abspath(ARGS.output_dir)))
+	outdir = os.path.abspath(ARGS.output_dir)
+	with SafeCD(os.path.join(WORKDIR.name, 'rpms')):
+		for rpm in glob.glob('*.rpm'):
+			shutil.move(rpm, os.path.join(outdir, os.path.basename(rpm)))
+
+if ARGS.generate_version is not None:
+	with SafeCD(os.path.join(WORKDIR.name, 'repo') if ARGS.build else SOURCE_REPO):
+		VERSION = get_package_version(
+		    'HEAD' if ARGS.build or ARGS.revision == 'DIRTY' else ARGS.revision, (ARGS.revision == 'DIRTY')
+		)
+	print('\n'.join(generate_versioninfo_variables(VERSION, ARGS.generate_version)))
