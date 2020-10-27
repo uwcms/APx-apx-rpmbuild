@@ -14,7 +14,7 @@ import sys
 import tempfile
 from typing import Dict, List, NoReturn, Optional
 
-logging.basicConfig(format='%(levelname).1s: %(message)s')
+logging.basicConfig(format='%(levelname).1s: %(message)s', level=logging.INFO)
 
 parser = argparse.ArgumentParser()
 # yapf: disable
